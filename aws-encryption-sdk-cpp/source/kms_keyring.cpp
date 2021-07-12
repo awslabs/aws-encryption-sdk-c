@@ -14,6 +14,7 @@
  */
 #include <aws/cryptosdk/private/kms_keyring.h>
 
+#include <aws/core/utils/ARN.h>
 #include <aws/core/utils/Outcome.h>
 #include <aws/core/utils/logging/LogMacros.h>
 #include <aws/core/utils/memory/MemorySystemInterface.h>
@@ -36,8 +37,9 @@ using Private::aws_byte_buf_dup_from_aws_utils;
 using Private::aws_map_from_c_aws_hash_table;
 using Private::aws_utils_byte_buffer_from_c_aws_byte_buf;
 
-static const char *AWS_CRYPTO_SDK_KMS_CLASS_TAG = "KmsKeyring";
-static const char *KEY_PROVIDER_STR             = "aws-kms";
+static const char *AWS_CRYPTO_SDK_KMS_CLASS_TAG              = "KmsKeyring";
+static const char *AWS_CRYPTO_SDK_DISCOVERY_FILTER_CLASS_TAG = "DiscoveryFilter";
+static const char *KEY_PROVIDER_STR                          = "aws-kms";
 
 static void DestroyKeyring(struct aws_cryptosdk_keyring *keyring) {
     auto keyring_data_ptr = static_cast<Aws::Cryptosdk::Private::KmsKeyringImpl *>(keyring);
@@ -78,16 +80,26 @@ static int OnDecrypt(
         const Aws::String key_arn = Private::aws_string_from_c_aws_byte_buf(&edk->provider_info);
 
         /* If there are no key IDs in the list, keyring is in "discovery" mode and will attempt KMS calls with
-         * every ARN it comes across in the message. If there are key IDs in the list, it will cross check the
-         * ARN it reads with that list before attempting KMS calls. Note that if caller provided key IDs in
-         * anything other than a CMK ARN format, the SDK will not attempt to decrypt those data keys, because
-         * the EDK data format always specifies the CMK with the full (non-alias) ARN.
+         * every key ARN it comes across in the message, so long as the key ARN is authorized by the
+         * DiscoveryFilter (matches the partition and an account ID).
+         *
+         * If there are key IDs in the list, it will cross check the ARN it reads with that list
+         * before attempting KMS calls. Note that if caller provided key IDs in anything other than
+         * a CMK ARN format, the SDK will not attempt to decrypt those data keys, because the EDK
+         * data format always specifies the CMK with the full (non-alias) ARN.
          */
         if (self->key_ids.size() &&
             std::find(self->key_ids.begin(), self->key_ids.end(), key_arn) == self->key_ids.end()) {
             // This keyring does not have access to the CMK used to encrypt this data key. Skip.
             continue;
         }
+        // self->discovery_filter is non-null only if self was constructed via BuildDiscovery, which
+        // in turn implies discovery mode
+        if (self->discovery_filter && !self->discovery_filter->IsAuthorized(key_arn)) {
+            // The DiscoveryFilter blocks the CMK used to encrypt this data key. Skip.
+            continue;
+        }
+
         Aws::String kms_region = Private::parse_region_from_kms_key_arn(key_arn);
         if (kms_region.empty()) {
             error_buf << "Error: Malformed ciphertext. Provider ID field of KMS EDK is invalid KMS CMK ARN: " << key_arn
@@ -104,6 +116,7 @@ static int OnDecrypt(
 
         Aws::KMS::Model::DecryptRequest kms_request;
         kms_request.WithGrantTokens(self->grant_tokens)
+            .WithKeyId(key_arn)
             .WithCiphertextBlob(aws_utils_byte_buffer_from_c_aws_byte_buf(&edk->ciphertext))
             .WithEncryptionContext(enc_ctx_cpp);
 
@@ -131,6 +144,10 @@ static int OnDecrypt(
                     AWS_CRYPTOSDK_WRAPPING_KEY_DECRYPTED_DATA_KEY | AWS_CRYPTOSDK_WRAPPING_KEY_VERIFIED_ENC_CTX);
             }
             return ret;
+        } else {
+            // Since we specified the key ARN explicitly in the request,
+            // KMS had better use that key to decrypt
+            return aws_raise_error(AWS_ERROR_INVALID_STATE);
         }
     }
 
@@ -149,31 +166,6 @@ static int OnEncrypt(
     struct aws_array_list *edk_list,
     const struct aws_hash_table *enc_ctx,
     enum aws_cryptosdk_alg_id alg) {
-    // Class that prevents memory leak of local array lists (even if a function throws)
-    // When the object is destroyed it will clean up the lists
-    class ListRaii {
-       public:
-        ListRaii(
-            int (*init_fn)(struct aws_allocator *, struct aws_array_list *),
-            void (*clean_up_fn)(struct aws_array_list *))
-            : init_fn(init_fn), clean_up_fn(clean_up_fn) {}
-        ~ListRaii() {
-            if (initialized) clean_up_fn(&list);
-        }
-        int Create(struct aws_allocator *alloc) {
-            int rv = init_fn(alloc, &list);
-            if (!rv) initialized = true;
-            return rv;
-        }
-
-        struct aws_array_list list;
-
-       private:
-        int (*init_fn)(struct aws_allocator *, struct aws_array_list *);
-        void (*clean_up_fn)(struct aws_array_list *);
-        bool initialized;
-    };
-
     if (!keyring || !request_alloc || !unencrypted_data_key || !edk_list || !enc_ctx) {
         abort();
     }
@@ -184,8 +176,8 @@ static int OnEncrypt(
         return AWS_OP_SUCCESS;
     }
 
-    ListRaii my_edks(aws_cryptosdk_edk_list_init, aws_cryptosdk_edk_list_clean_up);
-    ListRaii my_keyring_trace(aws_cryptosdk_keyring_trace_init, aws_cryptosdk_keyring_trace_clean_up);
+    Private::ListRaii my_edks(aws_cryptosdk_edk_list_init, aws_cryptosdk_edk_list_clean_up);
+    Private::ListRaii my_keyring_trace(aws_cryptosdk_keyring_trace_init, aws_cryptosdk_keyring_trace_clean_up);
     int rv = my_edks.Create(request_alloc);
     if (rv) return rv;
     rv = my_keyring_trace.Create(request_alloc);
@@ -325,16 +317,18 @@ Aws::Cryptosdk::Private::KmsKeyringImpl::KmsKeyringImpl(
     aws_cryptosdk_keyring_base_init(this, &kms_keyring_vt);
 }
 
-static std::shared_ptr<KMS::KMSClient> CreateDefaultKmsClient(const Aws::String &region) {
+static std::shared_ptr<KMS::KMSClient> CreateDefaultKmsClient(const char *allocationTag, const Aws::String &region) {
     Aws::Client::ClientConfiguration client_configuration;
-    client_configuration.region = region;
+    if (!region.empty()) {
+        client_configuration.region = region;
+    }
     client_configuration.userAgent += " " AWS_CRYPTOSDK_PRIVATE_VERSION_UA "/kms-keyring-cpp";
 #ifdef VALGRIND_TESTS
     // When running under valgrind, the default timeouts are too slow
     client_configuration.requestTimeoutMs = 10000;
     client_configuration.connectTimeoutMs = 10000;
 #endif
-    return Aws::MakeShared<Aws::KMS::KMSClient>(AWS_CRYPTO_SDK_KMS_CLASS_TAG, client_configuration);
+    return Aws::MakeShared<Aws::KMS::KMSClient>(allocationTag, client_configuration);
 }
 
 std::shared_ptr<KmsKeyring::SingleClientSupplier> KmsKeyring::SingleClientSupplier::Create(
@@ -361,7 +355,7 @@ std::shared_ptr<KMS::KMSClient> KmsKeyring::CachingClientSupplier::GetClient(
             return cache.at(region);
         }
     }
-    auto client    = CreateDefaultKmsClient(region);
+    auto client    = CreateDefaultKmsClient(AWS_CRYPTO_SDK_KMS_CLASS_TAG, region);
     report_success = [this, region, client] {
         std::unique_lock<std::mutex> lock(this->cache_mutex);
         this->cache[region] = client;
@@ -369,20 +363,35 @@ std::shared_ptr<KMS::KMSClient> KmsKeyring::CachingClientSupplier::GetClient(
     return client;
 }
 
-static std::shared_ptr<KmsKeyring::ClientSupplier> BuildClientSupplier(
+std::shared_ptr<KmsKeyring::ClientSupplier> Aws::Cryptosdk::Private::BuildClientSupplier(
     const Aws::Vector<Aws::String> &key_ids,
     const std::shared_ptr<Aws::KMS::KMSClient> kms_client,
     std::shared_ptr<KmsKeyring::ClientSupplier> client_supplier) {
+    // Postcondition: If the caller provides a KMS client, then BuildClientSupplier MUST return a client supplier wrapping the provided client.
     if (kms_client) {
         return KmsKeyring::SingleClientSupplier::Create(kms_client);
     }
 
     if (key_ids.size() == 1) {
         Aws::String region = Private::parse_region_from_kms_key_arn(key_ids.front());
-        return KmsKeyring::SingleClientSupplier::Create(CreateDefaultKmsClient(region));
+        std::shared_ptr<Aws::KMS::KMSClient> single_kms_client;
+        if (client_supplier) {
+            // Postcondition: If the caller provides only one key ID and a client supplier, then BuildClientSupplier MUST call the client supplier to obtain a KMS client in the key's region. BuildClientSupplier MUST return a client supplier that only supplies the obtained KMS client.
+            std::function<void()> report_success;
+            single_kms_client = client_supplier->GetClient(region, report_success);
+            report_success();
+        } else {
+            // Postcondition: If the caller provides only one key ID and no client supplier, then BuildClientSupplier MUST create a KMS client in the key's region, and it MUST return a client supplier that only supplies the created KMS client.
+            single_kms_client = CreateDefaultKmsClient(AWS_CRYPTO_SDK_KMS_CLASS_TAG, region);
+        }
+        return KmsKeyring::SingleClientSupplier::Create(single_kms_client);
     }
 
-    return client_supplier ? client_supplier : KmsKeyring::CachingClientSupplier::Create();
+    return client_supplier
+               // Postcondition: If the caller provides a client supplier, and provides zero or at least two key IDs, then BuildClientSupplier MUST return the provided client supplier.
+               ? client_supplier
+               // Postcondition: If the caller does not provide a client supplier, and provides zero or at least two key IDs, then BuildClientSupplier MUST return a default client supplier.
+               : KmsKeyring::CachingClientSupplier::Create();
 }
 
 aws_cryptosdk_keyring *KmsKeyring::Builder::Build(
@@ -407,7 +416,7 @@ aws_cryptosdk_keyring *KmsKeyring::Builder::Build(
         AWS_CRYPTO_SDK_KMS_CLASS_TAG,
         my_key_ids,
         grant_tokens,
-        BuildClientSupplier(my_key_ids, kms_client, client_supplier));
+        Private::BuildClientSupplier(my_key_ids, kms_client, client_supplier));
 }
 
 aws_cryptosdk_keyring *KmsKeyring::Builder::BuildDiscovery() const {
@@ -416,7 +425,21 @@ aws_cryptosdk_keyring *KmsKeyring::Builder::BuildDiscovery() const {
         AWS_CRYPTO_SDK_KMS_CLASS_TAG,
         empty_key_ids_list,
         grant_tokens,
-        BuildClientSupplier(empty_key_ids_list, kms_client, client_supplier));
+        Private::BuildClientSupplier(empty_key_ids_list, kms_client, client_supplier));
+}
+
+aws_cryptosdk_keyring *KmsKeyring::Builder::BuildDiscovery(std::shared_ptr<DiscoveryFilter> discovery_filter) const {
+    if (!discovery_filter) {
+        return nullptr;
+    }
+
+    Aws::Vector<Aws::String> empty_key_ids_list;
+    return Aws::New<Private::KmsKeyringImpl>(
+        AWS_CRYPTO_SDK_KMS_CLASS_TAG,
+        empty_key_ids_list,
+        grant_tokens,
+        Private::BuildClientSupplier(empty_key_ids_list, kms_client, client_supplier),
+        discovery_filter);
 }
 
 KmsKeyring::Builder &KmsKeyring::Builder::WithGrantTokens(const Aws::Vector<Aws::String> &grant_tokens) {
@@ -438,6 +461,60 @@ KmsKeyring::Builder &KmsKeyring::Builder::WithClientSupplier(
 KmsKeyring::Builder &KmsKeyring::Builder::WithKmsClient(const std::shared_ptr<KMS::KMSClient> &kms_client) {
     this->kms_client = kms_client;
     return *this;
+}
+
+bool KmsKeyring::DiscoveryFilter::IsAuthorized(const Aws::String &key_arn) const {
+    Utils::ARN arn(key_arn);
+    if (!arn) {
+        return false;
+    }
+
+    bool matching_partition = arn.GetPartition() == partition;
+    bool matching_account   = account_ids.find(arn.GetAccountId()) != account_ids.end();
+    return matching_partition && matching_account;
+}
+
+KmsKeyring::DiscoveryFilterBuilder KmsKeyring::DiscoveryFilter::Builder(Aws::String partition) {
+    KmsKeyring::DiscoveryFilterBuilder builder(partition);
+    return builder;
+}
+
+KmsKeyring::DiscoveryFilterBuilder &KmsKeyring::DiscoveryFilterBuilder::AddAccount(const Aws::String &account_id) {
+    this->account_ids.insert(account_id);
+    return *this;
+}
+
+KmsKeyring::DiscoveryFilterBuilder &KmsKeyring::DiscoveryFilterBuilder::AddAccounts(
+    const Aws::Vector<Aws::String> &account_ids) {
+    this->account_ids.insert(account_ids.begin(), account_ids.end());
+    return *this;
+}
+
+KmsKeyring::DiscoveryFilterBuilder &KmsKeyring::DiscoveryFilterBuilder::WithAccounts(
+    const Aws::Vector<Aws::String> &account_ids) {
+    this->account_ids.clear();
+    return this->AddAccounts(account_ids);
+}
+
+std::shared_ptr<KmsKeyring::DiscoveryFilter> KmsKeyring::DiscoveryFilterBuilder::Build() const {
+    // Must have at least one account ID, and partition and account IDs cannot be the empty string
+    if (account_ids.empty()) {
+        AWS_LOGSTREAM_ERROR(
+            AWS_CRYPTO_SDK_KMS_CLASS_TAG, "Invalid DiscoveryFilterBuilder: account IDs cannot be empty");
+        return nullptr;
+    }
+    if (partition.empty()) {
+        AWS_LOGSTREAM_ERROR(AWS_CRYPTO_SDK_KMS_CLASS_TAG, "Invalid DiscoveryFilterBuilder: partition cannot be blank");
+        return nullptr;
+    }
+    if (account_ids.find("") != account_ids.end()) {
+        AWS_LOGSTREAM_ERROR(
+            AWS_CRYPTO_SDK_KMS_CLASS_TAG, "Invalid DiscoveryFilterBuilder: account IDs cannot be blank");
+        return nullptr;
+    }
+
+    return Aws::MakeShared<Private::DiscoveryFilterImpl>(
+        AWS_CRYPTO_SDK_DISCOVERY_FILTER_CLASS_TAG, partition, account_ids);
 }
 
 }  // namespace Cryptosdk

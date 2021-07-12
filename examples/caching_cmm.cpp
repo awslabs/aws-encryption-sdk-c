@@ -34,6 +34,11 @@ void error(const char *description) {
     abort();
 }
 
+/**
+ * Note that this method buffers all output locally, and only returns it to the caller after all processing
+ * completes. This ensures that when decrypting a signed message the signature will be verified before any
+ * plaintext can be processed.
+ */
 std::vector<uint8_t> process_loop(struct aws_cryptosdk_session *session, const uint8_t *input, size_t in_len) {
     size_t out_needed = 1;
     size_t out_offset = 0, in_offset = 0;
@@ -66,8 +71,15 @@ std::vector<uint8_t> process_loop(struct aws_cryptosdk_session *session, const u
 }
 
 std::vector<uint8_t> encrypt(struct aws_allocator *alloc, struct aws_cryptosdk_cmm *cmm, const std::string &str) {
-    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_cmm(alloc, AWS_CRYPTOSDK_ENCRYPT, cmm);
+    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_cmm_2(alloc, AWS_CRYPTOSDK_ENCRYPT, cmm);
     if (!session) abort();
+
+    /* For clarity, we set the commitment policy explicitly. The COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+     * policy is selected by default in v2.0, so this is not required.
+     */
+    if (aws_cryptosdk_session_set_commitment_policy(session, COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT)) {
+        error("set_commitment_policy");
+    }
 
     if (aws_cryptosdk_session_set_message_size(session, str.size())) {
         error("set_message_size");
@@ -82,8 +94,15 @@ std::vector<uint8_t> encrypt(struct aws_allocator *alloc, struct aws_cryptosdk_c
 
 std::string decrypt(
     struct aws_allocator *alloc, struct aws_cryptosdk_cmm *cmm, const std::vector<uint8_t> &ciphertext) {
-    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_cmm(alloc, AWS_CRYPTOSDK_DECRYPT, cmm);
+    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_cmm_2(alloc, AWS_CRYPTOSDK_DECRYPT, cmm);
     if (!session) abort();
+
+    /* For clarity, we set the commitment policy explicitly. The COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+     * policy is selected by default in v2.0, so this is not required.
+     */
+    if (aws_cryptosdk_session_set_commitment_policy(session, COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT)) {
+        error("set_commitment_policy");
+    }
 
     std::vector<uint8_t> buffer = process_loop(session, ciphertext.data(), ciphertext.size());
 
@@ -99,11 +118,9 @@ std::string base64_encode(const std::vector<uint8_t> &vec) {
         error("aws_base64_compute_encoded_len");
     }
 
-    std::vector<uint8_t> tmp;
-    tmp.resize(b64_len);
-
+    std::vector<uint8_t> tmp(b64_len);
     struct aws_byte_cursor cursor = aws_byte_cursor_from_array(vec.data(), vec.size());
-    struct aws_byte_buf b64_buf   = aws_byte_buf_from_array(tmp.data(), tmp.size());
+    struct aws_byte_buf b64_buf   = aws_byte_buf_from_empty_array(tmp.data(), tmp.size());
 
     if (aws_base64_encode(&cursor, &b64_buf)) {
         error("aws_base64_encode");

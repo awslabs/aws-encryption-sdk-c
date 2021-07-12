@@ -99,7 +99,36 @@ struct aws_cryptosdk_keyring {
 };
 
 /**
- * Encryption request passed from the session to a CMM
+ * Governs how a @ref aws_cryptosdk_session behaves during configuration,
+ * encryption, and decryption, with respect to key commitment.
+ */
+enum aws_cryptosdk_commitment_policy {
+    /**
+     * Algorithm suite must support key commitment. Key commitment will be
+     * included in ciphertext on encrypt. Valid key commitment must be present
+     * in ciphertext on decrypt.
+     */
+    COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT = 0x598f396c,
+
+    /**
+     * Algorithm suite must support key commitment. Key commitment will be
+     * included in ciphertext on encrypt. On decrypt, if a key commitment is
+     * present on the ciphertext, then the key commitment must be valid.
+     */
+    COMMITMENT_POLICY_REQUIRE_ENCRYPT_ALLOW_DECRYPT = 0x493769b7,
+
+    /**
+     * Algorithm suite must NOT support key commitment. Key commitment will NOT
+     * be included in ciphertext on encrypt. On decrypt, if a key commitment is
+     * present on the ciphertext, then the key commitment must be valid.
+     */
+    COMMITMENT_POLICY_FORBID_ENCRYPT_ALLOW_DECRYPT = 0x2735f98a,
+};
+
+/**
+ * Encryption request passed from the session to a CMM. In general, you should
+ * not allocate or construct struct manually, since we may add additional
+ * fields.
  */
 struct aws_cryptosdk_enc_request {
     struct aws_allocator *alloc;
@@ -124,7 +153,19 @@ struct aws_cryptosdk_enc_request {
      * this will be UINT64_MAX.
      */
     uint64_t plaintext_size;
+    /**
+     * The key commitment policy to enforce when processing the encryption
+     * request. The CMM is responsible for selecting an algorithm that
+     * satisfies the commitment policy: if the commitment policy requires key
+     * commitment, then the algorithm must be a key-committing one; otherwise,
+     * the algorithm must NOT be a key-committing one.
+     */
+    enum aws_cryptosdk_commitment_policy commitment_policy;
 };
+
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_enc_request_is_valid(const struct aws_cryptosdk_enc_request *request) {
+    return request && aws_allocator_is_valid(request->alloc) && aws_hash_table_is_valid(request->enc_ctx);
+}
 
 /**
  * Materials returned from a CMM generate_enc_materials operation
@@ -150,6 +191,11 @@ struct aws_cryptosdk_dec_request {
     struct aws_array_list encrypted_data_keys;
     enum aws_cryptosdk_alg_id alg;
 };
+
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_dec_request_is_valid(const struct aws_cryptosdk_dec_request *request) {
+    return request && aws_allocator_is_valid(request->alloc) &&
+           aws_cryptosdk_edk_list_is_valid(&request->encrypted_data_keys) && aws_hash_table_is_valid(request->enc_ctx);
+}
 
 /**
  * Decryption materials returned from CMM to session
@@ -354,8 +400,15 @@ struct aws_cryptosdk_cmm_vt {
 /**
  * Putting this here for now, until we get it merged into the atomics.h in c-common
  */
-AWS_CRYPTOSDK_STATIC_INLINE bool aws_atomic_var_is_valid(const struct aws_atomic_var *var) {
-    return AWS_OBJECT_PTR_IS_WRITABLE(var);
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_atomic_var_is_valid_int(const struct aws_atomic_var *var) {
+    return AWS_MEM_IS_WRITABLE(var, sizeof(size_t));
+}
+
+/**
+ * Putting this here for now, until we get it merged into the atomics.h in c-common
+ */
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_atomic_var_is_valid_ptr(const struct aws_atomic_var *var) {
+    return AWS_OBJECT_PTR_IS_WRITABLE(var) && AWS_OBJECT_PTR_IS_WRITABLE((size_t *)aws_atomic_load_ptr(var));
 }
 
 /**
@@ -371,7 +424,7 @@ AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_cmm_vtable_is_valid(const struct 
  * cmm may add additional fields, they may define their own, specialized is_valid functions that use this as a base.
  */
 AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_cmm_base_is_valid(const struct aws_cryptosdk_cmm *cmm) {
-    return AWS_OBJECT_PTR_IS_WRITABLE(cmm) && aws_atomic_var_is_valid(&cmm->refcount) &&
+    return AWS_OBJECT_PTR_IS_WRITABLE(cmm) && aws_atomic_var_is_valid_int(&cmm->refcount) &&
            aws_atomic_load_int(&cmm->refcount) > 0 && aws_atomic_load_int(&cmm->refcount) <= SIZE_MAX &&
            aws_cryptosdk_cmm_vtable_is_valid(cmm->vtable);
 }
@@ -406,7 +459,7 @@ AWS_CRYPTOSDK_STATIC_INLINE void aws_cryptosdk_cmm_release(struct aws_cryptosdk_
  */
 AWS_CRYPTOSDK_STATIC_INLINE struct aws_cryptosdk_cmm *aws_cryptosdk_cmm_retain(struct aws_cryptosdk_cmm *cmm) {
     AWS_PRECONDITION(aws_cryptosdk_cmm_base_is_valid(cmm));
-    AWS_PRECONDITION(AWS_ATOMIC_VAR_INTVAL(&cmm->refcount) < SIZE_MAX);
+    AWS_PRECONDITION(aws_atomic_load_int(&cmm->refcount) < SIZE_MAX);
     aws_cryptosdk_private_refcount_up(&cmm->refcount);
     AWS_POSTCONDITION(aws_cryptosdk_cmm_base_is_valid(cmm));
     return cmm;
@@ -426,6 +479,12 @@ AWS_CRYPTOSDK_STATIC_INLINE int aws_cryptosdk_cmm_generate_enc_materials(
     struct aws_cryptosdk_cmm *cmm,
     struct aws_cryptosdk_enc_materials **output,
     struct aws_cryptosdk_enc_request *request) {
+    if (output) {
+        *output = NULL;
+    }
+    AWS_ERROR_PRECONDITION(aws_cryptosdk_cmm_base_is_valid(cmm), AWS_ERROR_UNIMPLEMENTED);
+    AWS_ERROR_PRECONDITION(output == NULL || AWS_OBJECT_PTR_IS_WRITABLE(output));
+    AWS_ERROR_PRECONDITION(request == NULL || aws_cryptosdk_enc_request_is_valid(request));
     AWS_CRYPTOSDK_PRIVATE_VF_CALL(generate_enc_materials, cmm, output, request);
     return ret;
 }
@@ -443,6 +502,13 @@ AWS_CRYPTOSDK_STATIC_INLINE int aws_cryptosdk_cmm_decrypt_materials(
     struct aws_cryptosdk_cmm *cmm,
     struct aws_cryptosdk_dec_materials **output,
     struct aws_cryptosdk_dec_request *request) {
+    if (output) {
+        *output = NULL;
+    }
+    AWS_ERROR_PRECONDITION(aws_cryptosdk_cmm_base_is_valid(cmm), AWS_ERROR_UNIMPLEMENTED);
+    AWS_ERROR_PRECONDITION(output == NULL || AWS_OBJECT_PTR_IS_WRITABLE(output));
+    AWS_ERROR_PRECONDITION(request == NULL || aws_cryptosdk_dec_request_is_valid(request));
+
     AWS_CRYPTOSDK_PRIVATE_VF_CALL(decrypt_materials, cmm, output, request);
     return ret;
 }
@@ -511,8 +577,8 @@ AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_keyring_vt_is_valid(const struct 
  * Constant time check of data-structure invariants for struct aws_cryptosdk_keyring.
  */
 AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_keyring_is_valid(const struct aws_cryptosdk_keyring *keyring) {
-    return AWS_OBJECT_PTR_IS_READABLE(keyring) && aws_atomic_var_is_valid(&keyring->refcount) &&
-           aws_atomic_load_int(&keyring->refcount) > 0 && aws_atomic_load_int(&keyring->refcount) <= SIZE_MAX &&
+    return AWS_OBJECT_PTR_IS_READABLE(keyring) && aws_atomic_var_is_valid_int(&keyring->refcount) &&
+           (aws_atomic_load_int(&keyring->refcount) > 0) && (aws_atomic_load_int(&keyring->refcount) <= SIZE_MAX) &&
            (keyring->vtable == NULL || aws_cryptosdk_keyring_vt_is_valid(keyring->vtable));
 }
 
@@ -524,6 +590,7 @@ AWS_CRYPTOSDK_STATIC_INLINE void aws_cryptosdk_keyring_base_init(
     struct aws_cryptosdk_keyring *keyring, const struct aws_cryptosdk_keyring_vt *vtable) {
     AWS_PRECONDITION(keyring != NULL);
     AWS_PRECONDITION(vtable == NULL || aws_cryptosdk_keyring_vt_is_valid(vtable));
+    AWS_PRECONDITION(vtable == NULL || aws_c_string_is_valid(vtable->name));
     keyring->vtable = vtable;
     aws_atomic_init_int(&keyring->refcount, 1);
 }
@@ -533,6 +600,7 @@ AWS_CRYPTOSDK_STATIC_INLINE void aws_cryptosdk_keyring_base_init(
  * Decrements the reference count on the keyring; if the new reference count is zero, the keyring is destroyed.
  */
 AWS_CRYPTOSDK_STATIC_INLINE void aws_cryptosdk_keyring_release(struct aws_cryptosdk_keyring *keyring) {
+    AWS_PRECONDITION(!keyring || (aws_cryptosdk_keyring_is_valid(keyring) && keyring->vtable != NULL));
     if (keyring && aws_cryptosdk_private_refcount_down(&keyring->refcount)) {
         AWS_CRYPTOSDK_PRIVATE_VF_CALL_NO_RETURN(destroy, keyring);
     }
@@ -544,6 +612,9 @@ AWS_CRYPTOSDK_STATIC_INLINE void aws_cryptosdk_keyring_release(struct aws_crypto
  */
 AWS_CRYPTOSDK_STATIC_INLINE struct aws_cryptosdk_keyring *aws_cryptosdk_keyring_retain(
     struct aws_cryptosdk_keyring *keyring) {
+    AWS_PRECONDITION(aws_cryptosdk_keyring_is_valid(keyring));
+    AWS_PRECONDITION(aws_atomic_var_is_valid_int(&keyring->refcount));
+    AWS_PRECONDITION(aws_atomic_load_int(&keyring->refcount) < SIZE_MAX);
     aws_cryptosdk_private_refcount_up(&keyring->refcount);
     return keyring;
 }
@@ -634,6 +705,32 @@ struct aws_cryptosdk_dec_materials *aws_cryptosdk_dec_materials_new(
  */
 AWS_CRYPTOSDK_API
 void aws_cryptosdk_dec_materials_destroy(struct aws_cryptosdk_dec_materials *dec_mat);
+
+/**
+ * Returns true if the given uint32_t is a valid @ref aws_cryptosdk_commitment_policy, or false otherwise.
+ */
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_commitment_policy_is_valid(uint32_t commitment_policy) {
+    switch (commitment_policy) {
+        case COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT:
+        case COMMITMENT_POLICY_REQUIRE_ENCRYPT_ALLOW_DECRYPT:
+        case COMMITMENT_POLICY_FORBID_ENCRYPT_ALLOW_DECRYPT: return true;
+        default: return false;
+    }
+}
+
+/**
+ * Returns true if encryption must include key commitment under the given key
+ * commitment policy, or false otherwise.
+ */
+AWS_CRYPTOSDK_STATIC_INLINE bool aws_cryptosdk_commitment_policy_encrypt_must_include_commitment(
+    enum aws_cryptosdk_commitment_policy commitment_policy) {
+    switch (commitment_policy) {
+        case COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT:
+        case COMMITMENT_POLICY_REQUIRE_ENCRYPT_ALLOW_DECRYPT: return true;
+        case COMMITMENT_POLICY_FORBID_ENCRYPT_ALLOW_DECRYPT: return false;
+        default: return false;
+    }
+}
 
 #ifdef __cplusplus
 }

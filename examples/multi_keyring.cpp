@@ -29,19 +29,20 @@ void encrypt_or_decrypt(
     size_t *output_len,
     const uint8_t *input,
     size_t input_len) {
-    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_keyring(alloc, mode, keyring);
+    struct aws_cryptosdk_session *session = aws_cryptosdk_session_new_from_keyring_2(alloc, mode, keyring);
     if (!session) abort();
 
-    if (mode == AWS_CRYPTOSDK_ENCRYPT) {
-        if (AWS_OP_SUCCESS != aws_cryptosdk_session_set_message_size(session, input_len)) abort();
+    /* For clarity, we set the commitment policy explicitly. The COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+     * policy is selected by default in v2.0, so this is not required.
+     */
+    if (aws_cryptosdk_session_set_commitment_policy(session, COMMITMENT_POLICY_REQUIRE_ENCRYPT_REQUIRE_DECRYPT)) {
+        fprintf(stderr, "set_commitment_policy failed: %s", aws_error_debug_str(aws_last_error()));
+        abort();
     }
 
-    size_t input_consumed;
     if (AWS_OP_SUCCESS !=
-        aws_cryptosdk_session_process(session, output, output_buf_sz, output_len, input, input_len, &input_consumed))
+        aws_cryptosdk_session_process_full(session, output, output_buf_sz, output_len, input, input_len))
         abort();
-    if (!aws_cryptosdk_session_is_done(session)) abort();
-    if (input_consumed != input_len) abort();
 
     /* This destroys the session but not the keyring, since the keyring pointer was not released. */
     aws_cryptosdk_session_destroy(session);
@@ -54,6 +55,9 @@ int main(int argc, char **argv) {
         printf("Usage: %s key_arn aes_256_key_file\n", argv[0]);
         return 1;
     }
+
+    aws_common_library_init(aws_default_allocator());
+    aws_cryptosdk_load_error_strings();
 
     Aws::SDKOptions options;
     Aws::InitAPI(options);

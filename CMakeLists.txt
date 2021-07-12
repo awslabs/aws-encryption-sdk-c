@@ -49,8 +49,8 @@ include(FindOpenSSL)
 set(PROJECT_NAME aws-encryption-sdk)
 
 # Version number of the SDK to be consumed by C code and Doxygen
-set(MAJOR 1)
-set(MINOR 1)
+set(MAJOR 2)
+set(MINOR 3)
 set(PATCH 0)
 
 # Compiler feature tests and feature flags
@@ -67,6 +67,10 @@ option(AWS_ENC_SDK_END_TO_END_TESTS "Enable end-to-end tests. If set to FALSE (t
 if(AWS_ENC_SDK_END_TO_END_TESTS)
     include(FindCURL)
 endif()
+
+option(AWS_ENC_SDK_KNOWN_GOOD_TESTS "Enable static test vectors.")
+
+option(AWS_ENC_SDK_END_TO_END_EXAMPLES "Enable end-to-end examples. If set to FALSE (the default), runs local examples only.")
 
 option(PERFORM_HEADER_CHECK "Performs compile-time checks that each header can be included independently. Requires a C++ compiler.")
 
@@ -135,8 +139,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/noninst_include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated/include>
+    $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
-    ${OPENSSL_INCLUDE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE ${PLATFORM_LIBS} ${OPENSSL_CRYPTO_LIBRARY})
@@ -152,7 +156,7 @@ target_include_directories(aws-encryption-sdk-test PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/noninst_include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated/include>
-    ${OPENSSL_INCLUDE_DIR}
+    $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>
 )
 
 target_link_libraries(aws-encryption-sdk-test PRIVATE ${PLATFORM_LIBS} ${OPENSSL_CRYPTO_LIBRARY})

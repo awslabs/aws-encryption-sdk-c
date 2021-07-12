@@ -23,6 +23,7 @@ struct test_case {
 
 extern struct test_case header_test_cases[];
 extern struct test_case cipher_test_cases[];
+extern struct test_case commitment_test_cases[];
 extern struct test_case materials_test_cases[];
 extern struct test_case enc_ctx_test_cases[];
 extern struct test_case encrypt_test_cases[];
@@ -40,6 +41,7 @@ extern struct test_case local_cache_test_cases[];
 extern struct test_case caching_cmm_test_cases[];
 extern struct test_case keyring_trace_test_cases[];
 extern struct test_case version_test_cases[];
+extern struct test_case max_edks_test_cases[];
 
 #define TEST_ASSERT(cond)                                                                        \
     do {                                                                                         \

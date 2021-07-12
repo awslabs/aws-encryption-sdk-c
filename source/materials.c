@@ -42,6 +42,8 @@ struct aws_cryptosdk_enc_materials *aws_cryptosdk_enc_materials_new(
 }
 
 void aws_cryptosdk_enc_materials_destroy(struct aws_cryptosdk_enc_materials *enc_mat) {
+    AWS_PRECONDITION(enc_mat == NULL || aws_cryptosdk_enc_materials_is_valid(enc_mat));
+
     if (enc_mat) {
         aws_cryptosdk_sig_abort(enc_mat->signctx);
         aws_byte_buf_clean_up_secure(&enc_mat->unencrypted_data_key);
@@ -74,6 +76,7 @@ struct aws_cryptosdk_dec_materials *aws_cryptosdk_dec_materials_new(
 }
 
 void aws_cryptosdk_dec_materials_destroy(struct aws_cryptosdk_dec_materials *dec_mat) {
+    AWS_PRECONDITION(dec_mat == NULL || aws_cryptosdk_dec_materials_is_valid(dec_mat));
     if (dec_mat) {
         aws_cryptosdk_sig_abort(dec_mat->signctx);
         aws_byte_buf_clean_up_secure(&dec_mat->unencrypted_data_key);
@@ -90,6 +93,13 @@ int aws_cryptosdk_keyring_on_encrypt(
     struct aws_array_list *edks,
     const struct aws_hash_table *enc_ctx,
     enum aws_cryptosdk_alg_id alg) {
+    AWS_PRECONDITION(aws_allocator_is_valid(request_alloc));
+    AWS_PRECONDITION(aws_cryptosdk_keyring_is_valid(keyring) && (keyring->vtable != NULL));
+    AWS_PRECONDITION(aws_byte_buf_is_valid(unencrypted_data_key));
+    AWS_PRECONDITION(aws_cryptosdk_keyring_trace_is_valid(keyring_trace));
+    AWS_PRECONDITION(aws_cryptosdk_edk_list_is_valid(edks) && aws_cryptosdk_edk_list_elements_are_valid(edks));
+    AWS_PRECONDITION(enc_ctx == NULL || aws_hash_table_is_valid(enc_ctx));
+
     /* Shallow copy of byte buffer: does NOT duplicate key bytes */
     const struct aws_byte_buf precall_data_key_buf = *unencrypted_data_key;
 
@@ -106,13 +116,15 @@ int aws_cryptosdk_keyring_on_encrypt(
     /* Postcondition: If this keyring generated data key, it must be the right length. */
     if (!precall_data_key_buf.buffer && unencrypted_data_key->buffer) {
         const struct aws_cryptosdk_alg_properties *props = aws_cryptosdk_alg_props(alg);
-        if (unencrypted_data_key->len != props->data_key_len) {
+        if (props == NULL || (unencrypted_data_key->len != props->data_key_len)) {
             return aws_raise_error(AWS_CRYPTOSDK_ERR_BAD_STATE);
         }
     }
 
     /* Postcondition: If data key was generated before call, byte buffer must not have been
-     * modified. Note that this only checks the metadata in the byte buffer and not the key
+     * modified.
+     *
+     * Note that this only checks the metadata in the byte buffer and not the key
      * bytes themselves. Verifying the key bytes were unchanged would require making an extra
      * copy of the key bytes, a case of the cure being worse than the disease.
      */
@@ -131,6 +143,13 @@ int aws_cryptosdk_keyring_on_decrypt(
     const struct aws_array_list *edks,
     const struct aws_hash_table *enc_ctx,
     enum aws_cryptosdk_alg_id alg) {
+    AWS_PRECONDITION(aws_allocator_is_valid(request_alloc));
+    AWS_PRECONDITION(aws_cryptosdk_keyring_is_valid(keyring) && (keyring->vtable != NULL));
+    AWS_PRECONDITION(aws_byte_buf_is_valid(unencrypted_data_key));
+    AWS_PRECONDITION(aws_cryptosdk_keyring_trace_is_valid(keyring_trace));
+    AWS_PRECONDITION(aws_cryptosdk_edk_list_is_valid(edks));
+    AWS_PRECONDITION(enc_ctx == NULL || aws_hash_table_is_valid(enc_ctx));
+
     /* Precondition: data key buffer must be unset. */
     if (unencrypted_data_key->buffer) return aws_raise_error(AWS_CRYPTOSDK_ERR_BAD_STATE);
     AWS_CRYPTOSDK_PRIVATE_VF_CALL(
@@ -142,7 +161,8 @@ int aws_cryptosdk_keyring_on_decrypt(
      */
     if (unencrypted_data_key->buffer) {
         const struct aws_cryptosdk_alg_properties *props = aws_cryptosdk_alg_props(alg);
-        if (unencrypted_data_key->len != props->data_key_len) return aws_raise_error(AWS_CRYPTOSDK_ERR_BAD_CIPHERTEXT);
+        if (props == NULL || unencrypted_data_key->len != props->data_key_len)
+            return aws_raise_error(AWS_CRYPTOSDK_ERR_BAD_CIPHERTEXT);
     }
     return ret;
 }

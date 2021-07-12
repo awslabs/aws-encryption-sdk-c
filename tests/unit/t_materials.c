@@ -74,9 +74,11 @@ int default_cmm_zero_keyring_dec_mat() {
     struct aws_cryptosdk_keyring *kr = aws_cryptosdk_zero_keyring_new(alloc);
     struct aws_cryptosdk_cmm *cmm    = aws_cryptosdk_default_cmm_new(alloc, kr);
 
-    struct aws_cryptosdk_dec_request req;
-    req.alg   = ALG_AES192_GCM_IV12_TAG16_NO_KDF;
-    req.alloc = aws_default_allocator();
+    struct aws_hash_table enc_ctx = { 0 };
+    TEST_ASSERT_SUCCESS(aws_cryptosdk_enc_ctx_init(alloc, &enc_ctx));
+    struct aws_cryptosdk_dec_request req = { .alg     = ALG_AES192_GCM_IV12_TAG16_NO_KDF,
+                                             .alloc   = aws_default_allocator(),
+                                             .enc_ctx = &enc_ctx };
 
     TEST_ASSERT_SUCCESS(aws_cryptosdk_edk_list_init(alloc, &req.encrypted_data_keys));
     struct aws_cryptosdk_edk edk;
@@ -93,6 +95,7 @@ int default_cmm_zero_keyring_dec_mat() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
     // clang-format on
 
+    aws_hash_table_clean_up(&enc_ctx);
     aws_cryptosdk_dec_materials_destroy(dec_mat);
     aws_cryptosdk_cmm_release(cmm);
     aws_cryptosdk_keyring_release(kr);
@@ -353,7 +356,7 @@ static int session_updates_cmm_refcount() {
 
     TEST_ASSERT_INT_EQ(aws_atomic_load_int(&cmm.refcount), 1);
 
-    session = aws_cryptosdk_session_new_from_cmm(aws_default_allocator(), AWS_CRYPTOSDK_ENCRYPT, &cmm);
+    session = aws_cryptosdk_session_new_from_cmm_2(aws_default_allocator(), AWS_CRYPTOSDK_ENCRYPT, &cmm);
     TEST_ASSERT_INT_EQ(aws_atomic_load_int(&cmm.refcount), 2);
 
     aws_cryptosdk_cmm_release(&cmm);
@@ -398,6 +401,10 @@ int on_encrypt_precondition_violation() {
     struct aws_cryptosdk_edk edk             = { { 0 } };
     TEST_ASSERT_SUCCESS(aws_array_list_push_back(&edks, &edk));
 
+    /* Precondition: If a data key has not already been generated, there must be no EDKs.
+     * Generating a new one and then pushing new EDKs on the list would cause the list of
+     * EDKs to be inconsistent. (i.e., they would decrypt to different data keys.)
+     */
     TEST_ASSERT_ERROR(
         AWS_CRYPTOSDK_ERR_BAD_STATE,
         aws_cryptosdk_keyring_on_encrypt(kr, alloc, &unencrypted_data_key, &keyring_trace, &edks, NULL, 0));
@@ -415,6 +422,34 @@ int on_encrypt_postcondition_violation() {
 
     struct aws_byte_buf unencrypted_data_key = { 0 };
 
+    /* Postcondition: If this keyring generated data key, it must be the right length. */
+    TEST_ASSERT_ERROR(
+        AWS_CRYPTOSDK_ERR_BAD_STATE,
+        aws_cryptosdk_keyring_on_encrypt(
+            kr,
+            alloc,
+            &unencrypted_data_key,
+            &keyring_trace,
+            &edks,
+            NULL,
+            ALG_AES256_GCM_IV12_TAG16_HKDF_SHA384_ECDSA_P384));
+
+    TEST_ASSERT(test_kr.on_encrypt_called);
+
+    teardown_condition_violation_test();
+    return 0;
+}
+
+int on_encrypt_data_key_exists_violation() {
+    TEST_ASSERT_SUCCESS(setup_condition_violation_test());
+    test_kr.generated_data_key_to_return        = aws_byte_buf_from_c_str("Something completely different");
+    test_kr.on_encrypt_ignore_existing_data_key = true;
+
+    struct aws_byte_buf unencrypted_data_key = aws_byte_buf_from_c_str("Oops, already set!");
+
+    /* Postcondition: If data key was generated before call, byte buffer must not have been
+     * modified.
+     */
     TEST_ASSERT_ERROR(
         AWS_CRYPTOSDK_ERR_BAD_STATE,
         aws_cryptosdk_keyring_on_encrypt(
@@ -436,6 +471,7 @@ int on_decrypt_precondition_violation() {
     /* Unencrypted data key buffer already set -> raise error and do not make virtual call */
     TEST_ASSERT_SUCCESS(setup_condition_violation_test());
 
+    /* Precondition: data key buffer must be unset. */
     struct aws_byte_buf unencrypted_data_key = aws_byte_buf_from_c_str("Oops, already set!");
     TEST_ASSERT_ERROR(
         AWS_CRYPTOSDK_ERR_BAD_STATE,
@@ -455,6 +491,10 @@ int on_decrypt_postcondition_violation() {
 
     test_kr.decrypted_data_key_to_return = aws_byte_buf_from_c_str("wrong data key length");
 
+    /* Postcondition: if data key was decrypted, its length must agree with algorithm
+     * specification. If this is not the case, it either means ciphertext was tampered
+     * with or the keyring implementation is not setting the length properly.
+     */
     TEST_ASSERT_ERROR(
         AWS_CRYPTOSDK_ERR_BAD_CIPHERTEXT,
         aws_cryptosdk_keyring_on_decrypt(
@@ -485,6 +525,7 @@ struct test_case materials_test_cases[] = {
     { "materials", "session_updates_cmm_refcount", session_updates_cmm_refcount },
     { "materials", "on_encrypt_precondition_violation", on_encrypt_precondition_violation },
     { "materials", "on_encrypt_postcondition_violation", on_encrypt_postcondition_violation },
+    { "materials", "on_encrypt_data_key_exists_violation", on_encrypt_data_key_exists_violation },
     { "materials", "on_decrypt_precondition_violation", on_decrypt_precondition_violation },
     { "materials", "on_decrypt_postcondition_violation", on_decrypt_postcondition_violation },
     { NULL }

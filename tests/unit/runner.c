@@ -18,8 +18,10 @@
 #include <string.h>
 #include "testing.h"
 
+#include <aws/common/common.h>
 #include <aws/common/error.h>
 #include <aws/cryptosdk/error.h>
+#include <aws/cryptosdk/private/session.h>
 
 int pass_fn() {
     return 0;
@@ -27,6 +29,7 @@ int pass_fn() {
 
 struct test_case *test_groups[] = { header_test_cases,
                                     cipher_test_cases,
+                                    commitment_test_cases,
                                     materials_test_cases,
                                     enc_ctx_test_cases,
                                     encrypt_test_cases,
@@ -43,6 +46,7 @@ struct test_case *test_groups[] = { header_test_cases,
                                     local_cache_test_cases,
                                     caching_cmm_test_cases,
                                     keyring_trace_test_cases,
+                                    max_edks_test_cases,
                                     NULL };
 
 struct test_case *test_cases;
@@ -102,6 +106,7 @@ static void enable_cases(const char *specifier) {
 }
 
 int main(int argc, char **argv) {
+    aws_common_library_init(aws_default_allocator());
     aws_cryptosdk_load_error_strings();
 
     int ret;
